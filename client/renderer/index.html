@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: transparent;
+      overflow: hidden;
+    }
+    #canvas-container {
+      width: 100vw;
+      height: 100vh;
+    }
+  </style>
+</head>
+<body>
+  <div id="canvas-container"></div>
+
+  <!-- Cubism Core грузится динамически внутри renderer.js (через appRoot,
+       полученный по IPC) — так путь резолвится верно и в dev, и в
+       упакованном exe. Статический <script src="../live2d-core/..."> тут
+       не сработал бы в упакованном виде (относительный путь внутри asar). -->
+  <script src="./renderer.js"></script>
+</body>
+</html>

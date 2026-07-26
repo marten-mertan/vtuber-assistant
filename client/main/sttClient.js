@@ -1,9 +1,10 @@
 // sttClient.js
-// Клиент для локального STT-сервиса (python-services/stt/server.py).
+// Клиент для STT-части объединённого voice-сервиса
+// (python-services/voice/server.py).
 // Модель push-to-talk: start() начинает запись с микрофона на стороне
 // Python-сервиса, stop() останавливает и возвращает распознанный текст.
 
-export class STTClient {
+class STTClient {
   constructor({ baseUrl }) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
   }
@@ -20,7 +21,7 @@ export class STTClient {
   }
 
   async start() {
-    const res = await fetch(`${this.baseUrl}/start`, { method: "POST" });
+    const res = await fetch(`${this.baseUrl}/stt/start`, { method: "POST" });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       throw new Error(body.error || `HTTP ${res.status}`);
@@ -29,7 +30,7 @@ export class STTClient {
 
   /** Останавливает запись, возвращает { text, duration } */
   async stop() {
-    const res = await fetch(`${this.baseUrl}/stop`, { method: "POST" });
+    const res = await fetch(`${this.baseUrl}/stt/stop`, { method: "POST" });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       throw new Error(body.error || `HTTP ${res.status}`);
@@ -37,3 +38,5 @@ export class STTClient {
     return res.json();
   }
 }
+
+module.exports = { STTClient };

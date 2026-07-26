@@ -1,0 +1,33 @@
+{
+  "name": "vtuber-client",
+  "version": "0.1.0",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "start": "chcp 65001 >NUL & electron .",
+    "dist": "set CSC_IDENTITY_AUTO_DISCOVERY=false&& electron-builder --win --dir"
+  },
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "dependencies": {
+    "pixi.js": "6.5.10",
+    "pixi-live2d-display": "0.4.0",
+    "dotenv": "^16.4.5"
+  },
+  "build": {
+    "appId": "com.local.vtuber-assistant",
+    "productName": "VTuberAssistant",
+    "directories": {
+      "output": "../dist"
+    },
+    "files": [
+      "main.js",
+      "main/**/*",
+      "renderer/**/*",
+      "package.json",
+      "node_modules/**/*"
+    ]
+  }
+}

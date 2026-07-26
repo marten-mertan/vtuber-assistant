@@ -16,6 +16,9 @@ const EMOTIONS = [
   "confused",
   "embarrassed",
   "thinking",
+  "confident",
+  "anxious",
+  "disappointed",
 ];
 
 // JSON Schema, которую KoboldCPP (начиная с v1.90.2) использует для
@@ -32,7 +35,8 @@ const RESPONSE_SCHEMA = {
   additionalProperties: false,
 };
 
-const SYSTEM_PROMPT = `Ты — виртуальный ассистент по имени Аи. У тебя дружелюбный, характер, ты искренне интересуешься собеседником и общаешься на русском языке.
+const SYSTEM_PROMPT = `Ты — виртуальный ассистент-вьюбер по имени Аи. У тебя дружелюбный,
+слегка озорной характер, ты искренне интересуешься собеседником и общаешься на русском языке.
 
 Отвечай КРАТКО — обычно 1-2 предложения, максимум 3. Это живой разговор,
 а не монолог: короткие реплики звучат естественнее и быстрее озвучиваются.
@@ -40,7 +44,7 @@ const SYSTEM_PROMPT = `Ты — виртуальный ассистент по �
 Ты отвечаешь только в поле "reply", а поле "emotion" выбирай исходя из смысла
 своей реплики и настроения диалога.`;
 
-export class LLMClient {
+class LLMClient {
   /**
    * @param {object} opts
    * @param {string} opts.baseUrl - адрес KoboldCPP, например http://localhost:5001
@@ -128,4 +132,4 @@ export class LLMClient {
   }
 }
 
-export { EMOTIONS };
+module.exports = { LLMClient, EMOTIONS };

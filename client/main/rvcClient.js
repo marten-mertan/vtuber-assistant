@@ -1,8 +1,9 @@
 // rvcClient.js
-// Клиент для локального RVC-сервиса (python-services/rvc/server.py) —
-// опциональный шаг перекраски тембра голоса поверх результата Silero TTS.
+// Клиент для RVC-части объединённого voice-сервиса
+// (python-services/voice/server.py) — опциональный шаг перекраски тембра
+// голоса поверх результата Silero TTS.
 
-export class RVCClient {
+class RVCClient {
   constructor({ baseUrl }) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
   }
@@ -32,7 +33,7 @@ export class RVCClient {
     if (options.protect !== undefined) params.set("protect", options.protect);
 
     const query = params.toString() ? `?${params.toString()}` : "";
-    const res = await fetch(`${this.baseUrl}/convert${query}`, {
+    const res = await fetch(`${this.baseUrl}/rvc/convert${query}`, {
       method: "POST",
       headers: { "Content-Type": "audio/wav" },
       body: wavBuffer,
@@ -44,3 +45,5 @@ export class RVCClient {
     return Buffer.from(arrayBuffer);
   }
 }
+
+module.exports = { RVCClient };

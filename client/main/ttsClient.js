@@ -3,12 +3,12 @@
 // и проигрывание полученного WAV средствами Windows (PowerShell SoundPlayer) —
 // без сторонних npm-пакетов, которые могут не собраться на Windows.
 
-import { spawn } from "node:child_process";
-import { writeFile, mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import path from "node:path";
+const { spawn } = require("node:child_process");
+const { writeFile, mkdtemp, rm } = require("node:fs/promises");
+const { tmpdir } = require("node:os");
+const path = require("node:path");
 
-export class TTSClient {
+class TTSClient {
   constructor({ baseUrl, speaker }) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
     this.speaker = speaker;
@@ -46,8 +46,11 @@ export class TTSClient {
   }
 }
 
-/** Проигрывает WAV-буфер синхронно (ждёт окончания воспроизведения) */
-export async function playWavBuffer(buffer) {
+/** Проигрывает WAV-буфер синхронно (ждёт окончания воспроизведения).
+ * Актуально только для консольного chat.js (fallback без оверлея) —
+ * в основном приложении звук играет renderer через Web Audio API
+ * (нужно для lip-sync, чего у чистого Node-процесса просто нет). */
+async function playWavBuffer(buffer) {
   const dir = await mkdtemp(path.join(tmpdir(), "vtuber-tts-"));
   const filePath = path.join(dir, "reply.wav");
   await writeFile(filePath, buffer);
@@ -68,3 +71,5 @@ export async function playWavBuffer(buffer) {
     await rm(dir, { recursive: true, force: true });
   }
 }
+
+module.exports = { TTSClient, playWavBuffer };
