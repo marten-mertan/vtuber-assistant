@@ -1,0 +1,14 @@
+{
+  "_comment": "Карта emotion (из LLM) -> код(ы) выражения Live2D-модели (Name из Expressions в её model3.json). Несколько кодов в массиве — рендерер выбирает случайный при каждом срабатывании, для разнообразия. Emotion без записи (или с пустым массивом) сбрасывает модель в дефолтное выражение.",
+
+  "happy": [],
+  "excited": ["ex"],
+  "sad": ["s"],
+  "angry": ["an"],
+  "confused": ["c"],
+  "embarrassed": ["em"],
+  "thinking": ["th"],
+  "confident": ["con1", "con2"],
+  "anxious": ["anx"],
+  "disappointed": ["dis"]
+}
