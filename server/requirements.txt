@@ -1,7 +1,7 @@
 flask==3.0.3
 soundfile==0.12.1
 python-dotenv==1.0.1
-rvc-python
+infer_rvc_python
 openai-whisper
 sounddevice==0.4.7
 numpy<2.0

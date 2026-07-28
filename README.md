@@ -38,6 +38,7 @@ LLM-бэкенд (KoboldCPP или архитектурно схожий) зап
 - **16+ ГБ ОЗУ** — при 8-16 ГБ возможна нехватка памяти при одновременной работе LLM + STT (см. [Известные проблемы](#известные-проблемы))
 - **Node.js** 18+ и npm
 - **Python** 3.10+
+- **ffmpeg** (системный бинарник, для RVC) и на Windows — **Microsoft Visual C++ Build Tools** (см. раздел установки)
 - **KoboldCPP** (или другой OpenAI-совместимый LLM-сервер) + GGUF-модель — устанавливается и запускается отдельно
 - **Live2D Cubism SDK for Web** (Core-файл) — скачивается отдельно, не входит в репозиторий по лицензии
 - **Live2D-модель** (формат Cubism 3/4: `.model3.json` + `.moc3` + текстуры)
@@ -54,6 +55,14 @@ GGUF-модель, убедись что сервер поднимается и 
 
 ### 2. Голосовой сервис (`server/`)
 
+Нужен установленный **ffmpeg** в системе (не pip-пакет — реальный бинарник в
+`PATH`, требуется библиотекой RVC). Проверь: `ffmpeg -version`. Если нет —
+`winget install ffmpeg` или скачай с официального сайта.
+
+На Windows также нужны **Microsoft Visual C++ Build Tools** (workload
+"C++ build tools" + Windows 10/11 SDK) — без них может не собраться одна
+из зависимостей при установке. Если ставится без ошибок — можно пропустить.
+
 ```powershell
 cd server
 python -m venv venv
@@ -64,7 +73,7 @@ pip install -r requirements-gpu.txt --force-reinstall
 
 Порядок важен: `requirements-gpu.txt` (torch+torchaudio под CUDA 12.8)
 ставится **последним**, с `--force-reinstall` — гарантирует совместимую
-пару вместо той, что мог подтянуть `rvc-python` как побочную зависимость.
+пару вместо той, что могла подтянуться как побочная зависимость.
 
 ### 3. Клиент (`client/`)
 
@@ -178,11 +187,16 @@ Developer Mode (Параметры → Для разработчиков → Р�
 Попробуй меньшую модель Whisper (`STT_MODEL_SIZE=small` или `base`) и
 следи за загрузкой GPU-оффлоада LLM.
 
-**RVC-модель падает с `'tuple' object has no attribute 'dtype'`** — на
-практике это следствие сбоя загрузки HuBERT-чекпоинта из-за
-`weights_only=True` по умолчанию в PyTorch 2.6+ (см. патч в
-`server/patches.py` — уже применён, но если ловишь это на своей модели,
-проверь, что патч действительно импортируется раньше `rvc_python`).
+**Ошибка загрузки HuBERT/RMVPE-чекпоинта при старте RVC** — на практике
+частая причина — `weights_only=True` по умолчанию в PyTorch 2.6+, старые
+чекпоинты этот режим не проходят. См. патч в `server/patches.py` (уже
+применён) — если ловишь это на своей конфигурации, проверь, что
+`patches.apply()` вызывается **до** импорта `rvc_service`/`infer_rvc_python`
+в `server/server.py`.
+
+**`infer_rvc_python` не устанавливается / падает при `pip install`** —
+почти всегда либо не хватает **ffmpeg** в `PATH`, либо не
+установлены **Microsoft Visual C++ Build Tools** — см. раздел установки.
 
 **Голос после RVC звучит "мультяшно"/роботизированно** — обычно
 несовпадение диапазона высоты исходного голоса (TTS) и голоса, на
@@ -214,7 +228,7 @@ vtuber-assistant/
 [KoboldCPP](https://github.com/LostRuins/koboldcpp) ·
 [Silero TTS](https://github.com/snakers4/silero-models) ·
 [RVC](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI)
-(через [rvc-python](https://pypi.org/project/rvc-python/)) ·
+(через [infer_rvc_python](https://pypi.org/project/infer-rvc-python/)) ·
 [OpenAI Whisper](https://github.com/openai/whisper) ·
 [Live2D Cubism SDK](https://www.live2d.com/en/sdk/about/)
 

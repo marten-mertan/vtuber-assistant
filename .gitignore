@@ -37,7 +37,9 @@ __pycache__/
 models/tts/*
 !models/tts/.gitkeep
 
-# RVC — веса своих/скачанных голосовых моделей (.pth, .index)
+# RVC — веса своих/скачанных голосовых моделей (.pt, .pth, .index)
+server/rmvpe.pt
+server/hubert_base.pt
 models/rvc/*
 !models/rvc/.gitkeep
 
