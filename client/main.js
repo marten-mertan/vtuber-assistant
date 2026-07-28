@@ -65,6 +65,14 @@ ipcMain.on("get-app-root", (event) => {
   event.returnValue = appRoot;
 });
 
+// Единственное место, где снимается isBusy — renderer сам знает, когда
+// реально доиграл последний чанк звука (main этого напрямую не видит,
+// у него только сетевые вызовы TTS/RVC, не факт воспроизведения).
+ipcMain.on("renderer-idle", () => {
+  isBusy = false;
+  console.log("[pipeline] busy снят (renderer подтвердил, что всё доиграно)");
+});
+
 // --- Автозапуск server/server.py как дочернего процесса -------------------
 
 function spawnVoiceServer() {
@@ -173,6 +181,7 @@ async function startRecording() {
   try {
     await stt.start();
     isRecording = true;
+    isBusy = true; // единый флаг "занято" держится до подтверждения от renderer, что звук доиграл (см. ipcMain.on("renderer-idle"))
     win.webContents.send("assistant-status", { state: "listening" });
     console.log("[pipeline] recording started");
   } catch (err) {
@@ -181,10 +190,41 @@ async function startRecording() {
   }
 }
 
+// Совпадает с диапазонами эмодзи, которые чистит server/tts_service.py —
+// если после их удаления в чанке не осталось ни одной буквы/цифры,
+// озвучивать нечего, TTS вообще не дёргаем.
+const HAS_SPEAKABLE_CHARS = /[\p{L}\p{N}]/u;
+
+/** Синтезирует речь для одного чанка текста (TTS, затем опционально RVC) */
+async function synthesizeChunk(text) {
+  if (!voiceEnabled) return null;
+  if (!HAS_SPEAKABLE_CHARS.test(text)) {
+    console.log(`[pipeline] Чанк без произносимых символов, TTS пропущен: "${text}"`);
+    return null;
+  }
+  try {
+    const { buffer: sileroBuffer } = await tts.synthesize(text);
+    let finalBuffer = sileroBuffer;
+    if (rvcEnabled) {
+      try {
+        finalBuffer = await rvc.convert(sileroBuffer);
+      } catch (rvcErr) {
+        console.warn(`[pipeline] RVC failed for chunk, using Silero audio: ${rvcErr.message}`);
+      }
+    }
+    // Uint8Array напрямую (structured clone) — НЕ base64: конвертация
+    // base64 -> бинарные данные на стороне renderer синхронно блокирует
+    // поток рендеринга модели на заметное время.
+    return new Uint8Array(finalBuffer);
+  } catch (ttsErr) {
+    console.warn(`[pipeline] TTS failed for chunk: ${ttsErr.message}`);
+    return null;
+  }
+}
+
 async function stopRecordingAndRespond() {
   if (!isRecording) return;
   isRecording = false;
-  isBusy = true;
   win.webContents.send("assistant-status", { state: "thinking" });
 
   try {
@@ -194,47 +234,68 @@ async function stopRecordingAndRespond() {
     );
 
     if (warning || !text) {
-      win.webContents.send("assistant-status", { state: "idle" });
-      isBusy = false;
+      win.webContents.send("assistant-turn-done", {});
       return;
     }
 
-    const { reply, emotion } = await llm.send(text);
-    console.log(`[pipeline] LLM [${emotion}]: ${reply}`);
+    win.webContents.send("assistant-chunk-start", { userText: text });
 
-    let audioData = null;
-    if (voiceEnabled) {
-      try {
-        const { buffer: sileroBuffer } = await tts.synthesize(reply);
-        let finalBuffer = sileroBuffer;
-        if (rvcEnabled) {
-          try {
-            finalBuffer = await rvc.convert(sileroBuffer);
-          } catch (rvcErr) {
-            console.warn(`[pipeline] RVC failed, using Silero audio: ${rvcErr.message}`);
-          }
-        }
-        // Передаём как Uint8Array напрямую (structured clone) — НЕ через
-        // base64: конвертация base64 -> бинарные данные на стороне
-        // renderer (atob + побайтовый цикл) синхронно блокирует поток
-        // рендеринга модели на заметное время, вызывая подвисания.
-        audioData = new Uint8Array(finalBuffer);
-      } catch (ttsErr) {
-        console.warn(`[pipeline] TTS failed: ${ttsErr.message}`);
+    // Очередь предложений от LLM-стрима. onSentence вызывается синхронно
+    // по мере чтения SSE — сам TTS/RVC для чанка НЕ ждём тут же (это бы
+    // застопорило чтение следующих токенов), а складываем в очередь и
+    // разбираем отдельным "воркером" ниже, который работает параллельно
+    // с продолжающимся чтением потока от LLM.
+    const sentenceQueue = [];
+    let queueWake = null;
+    let streamDone = false;
+    let chunkIndex = 0;
+
+    function enqueue(sentenceText) {
+      sentenceQueue.push(sentenceText);
+      if (queueWake) {
+        queueWake();
+        queueWake = null;
       }
     }
 
-    win.webContents.send("assistant-reply", {
-      userText: text,
-      reply,
-      emotion,
-      audio: audioData,
+    async function drainQueue() {
+      while (true) {
+        if (sentenceQueue.length === 0) {
+          if (streamDone) return;
+          await new Promise((resolve) => {
+            queueWake = resolve;
+          });
+          continue;
+        }
+        const sentenceText = sentenceQueue.shift();
+        const idx = chunkIndex++;
+        const audio = await synthesizeChunk(sentenceText);
+        win.webContents.send("assistant-chunk", { index: idx, text: sentenceText, audio });
+      }
+    }
+
+    const drainPromise = drainQueue();
+
+    const { reply, emotion } = await llm.sendStream(text, {
+      onEmotion: (em) => {
+        win.webContents.send("assistant-emotion", { emotion: em });
+      },
+      onSentence: (sentenceText) => enqueue(sentenceText),
     });
+
+    streamDone = true;
+    if (queueWake) {
+      queueWake();
+      queueWake = null;
+    }
+    await drainPromise;
+
+    console.log(`[pipeline] LLM [${emotion}] (полный ответ): ${reply}`);
+    win.webContents.send("assistant-turn-done", {});
   } catch (err) {
     console.error(`[pipeline] error: ${err.message}`);
     win.webContents.send("assistant-status", { state: "error", message: err.message });
-  } finally {
-    isBusy = false;
+    win.webContents.send("assistant-turn-done", {});
   }
 }
 
@@ -251,7 +312,7 @@ app.whenReady().then(async () => {
     if (ok) {
       backendReady = true;
       console.log("[voice-server] Готов.");
-      win.webContents.send("assistant-status", { state: "idle" });
+      win.webContents.send("assistant-status", { state: "ready" });
     } else {
       console.error("[voice-server] Не поднялся за отведённое время — проверь логи выше.");
       win.webContents.send("assistant-status", {

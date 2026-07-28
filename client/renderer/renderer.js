@@ -212,7 +212,7 @@ const hud = document.createElement("div");
 hud.style.cssText = `
   position: fixed; left: 16px; bottom: 16px; max-width: 420px;
   font-family: sans-serif; font-size: 13px; color: #fff;
-  background: rgba(0,0,0,0.55); padding: 8px 12px; border-radius: 8px;
+  background: rgba(0,0,0,0.55); padding: 8px 12px 8px 12px; border-radius: 8px;
   pointer-events: none; white-space: pre-wrap;
 `;
 hud.textContent = "";
@@ -220,6 +220,49 @@ document.body.appendChild(hud);
 
 function setHud(text) {
   hud.textContent = text;
+  repositionBusyDot();
+}
+
+// Индикатор занятости — маленькая красная точка в правом верхнем углу
+// HUD-окна. Горит, пока идёт запись/распознавание/генерация/озвучка —
+// то есть пока новую запись начинать рано (перебьёт текущий ответ).
+const busyDot = document.createElement("div");
+busyDot.style.cssText = `
+  position: fixed; left: 16px; bottom: 16px; width: 10px; height: 10px;
+  border-radius: 50%; background: #ff3b30; box-shadow: 0 0 6px #ff3b30;
+  display: none; pointer-events: none;
+`;
+document.body.appendChild(busyDot);
+
+// Позиционируем точку относительно реального размера HUD (правый верхний
+// угол), пересчитываем при каждом обновлении текста — блок растёт вниз
+// и вширь по контенту, фиксированных размеров у него нет.
+function repositionBusyDot() {
+  const rect = hud.getBoundingClientRect();
+  busyDot.style.left = `${rect.right - 6}px`;
+  busyDot.style.bottom = `${window.innerHeight - rect.top - 6}px`;
+}
+
+let busy = false; // идёт запись/обработка/озвучка текущего ответа
+let turnDone = true; // стрим текущего ответа от LLM уже закончился (но чанки могут ещё доигрывать)
+
+function refreshBusyIndicator() {
+  const wasBusy = busy;
+  if (turnDone && !playbackActive && chunkBuffer.size === 0) {
+    busy = false;
+  }
+  busyDot.style.display = busy ? "block" : "none";
+  if (busy) repositionBusyDot();
+
+  // Сообщаем main ровно в момент перехода "занято" -> "свободно" — это
+  // единственное место в системе, где реально известно, что звук
+  // доиграл, а не просто обработался. main держит на этом свой isBusy
+  // (единый флаг на весь пайплайн, важно для будущих фич — скриншоты
+  // экрана/поведенческие паттерны не должны стартовать, пока модель
+  // ещё говорит).
+  if (wasBusy && !busy) {
+    ipcRenderer.send("renderer-idle");
+  }
 }
 
 // --- Воспроизведение аудио через Web Audio API + lip-sync ---
@@ -285,29 +328,67 @@ async function playAudio(uint8Array) {
 // --- IPC: получаем статусы и ответы из main-процесса (pipeline в main.js) ---
 
 ipcRenderer.on("assistant-status", (_event, { state, message }) => {
-  if (state === "starting") setHud(`⏳ ${message || "Запускаюсь..."}`);
-  else if (state === "listening") setHud("🎤 Слушаю...");
-  else if (state === "thinking") setHud("💭 Думаю...");
-  else if (state === "error") setHud(`⚠️ Ошибка: ${message}`);
-  else if (state === "idle") setHud("");
+  if (state === "starting") {
+    setHud(`⏳ ${message || "Запускаюсь..."}`);
+  } else if (state === "ready") {
+    setHud("Нажми Ctrl+Alt+Space и скажи что-нибудь — я слушаю.");
+  } else if (state === "listening") {
+    setHud("🎤 Слушаю...");
+    busy = true;
+    turnDone = false; // цикл только начался, ждём assistant-turn-done
+    refreshBusyIndicator();
+  } else if (state === "thinking") {
+    setHud("💭 Думаю...");
+  } else if (state === "error") {
+    setHud(`⚠️ Ошибка: ${message}`);
+    // Не оставляем "занято" висеть навсегда, если что-то сломалось.
+    // busy НЕ трогаем напрямую — иначе refreshBusyIndicator не увидит
+    // переход true->false и не уведомит main (см. renderer-idle ниже).
+    // Форсируем "нечего больше ждать", остальное посчитает сама функция.
+    turnDone = true;
+    playbackActive = false;
+    chunkBuffer.clear();
+    refreshBusyIndicator();
+  }
 });
 
-ipcRenderer.on("assistant-reply", async (_event, { userText, reply, emotion, audio }) => {
-  setHud(`Ты: ${userText}\nАи [${emotion}]: ${reply}`);
+// --- Потоковый пайплайн: реплика приходит по частям (см. main.js) ---
+// chunk-start сбрасывает очередь; emotion применяется сразу (не ждёт
+// звука); chunk кладётся в очередь и проигрывается СТРОГО по индексу —
+// даже если чанки готовы не по порядку (TTS/RVC на разные фразы может
+// занять разное время), не переставляя сами предложения местами.
 
-  if (currentModel) {
-    const options = emotionMap[emotion];
-    const exprName = options && options.length > 0
-      ? options[Math.floor(Math.random() * options.length)]
-      : null;
-    if (exprName) {
-      currentModel.expression(exprName);
-    } else {
-      // emotion без соответствия (или пустой массив) — сброс в дефолт,
-      // чтобы не оставалось "залипшее" предыдущее выражение.
-      currentModel.internalModel.motionManager.expressionManager?.resetExpression();
-    }
+let chunkBuffer = new Map(); // index -> { text, audio }
+let nextPlayIndex = 0;
+let playbackActive = false;
+let hudUserText = "";
+let hudReplyText = "";
+
+function applyEmotion(emotion) {
+  if (!currentModel) return;
+  const options = emotionMap[emotion];
+  const exprName = options && options.length > 0 ? options[Math.floor(Math.random() * options.length)] : null;
+  if (exprName) {
+    currentModel.expression(exprName);
+  } else {
+    // emotion без соответствия (или пустой массив) — сброс в дефолт,
+    // чтобы не оставалось "залипшее" предыдущее выражение.
+    currentModel.internalModel.motionManager.expressionManager?.resetExpression();
   }
+}
+
+async function tryPlayNextChunk() {
+  if (playbackActive) return;
+  if (!chunkBuffer.has(nextPlayIndex)) return;
+
+  playbackActive = true;
+  refreshBusyIndicator();
+  const { text, audio } = chunkBuffer.get(nextPlayIndex);
+  chunkBuffer.delete(nextPlayIndex);
+  nextPlayIndex++;
+
+  hudReplyText += (hudReplyText ? " " : "") + text;
+  setHud(`Ты: ${hudUserText}\nАи: ${hudReplyText}`);
 
   if (audio) {
     try {
@@ -316,6 +397,36 @@ ipcRenderer.on("assistant-reply", async (_event, { userText, reply, emotion, aud
       console.error("Ошибка воспроизведения аудио:", err);
     }
   }
+
+  playbackActive = false;
+  refreshBusyIndicator();
+  tryPlayNextChunk(); // вдруг следующий чанк уже накопился, пока этот играл
+}
+
+ipcRenderer.on("assistant-chunk-start", (_event, { userText }) => {
+  chunkBuffer.clear();
+  nextPlayIndex = 0;
+  playbackActive = false;
+  hudUserText = userText;
+  hudReplyText = "";
+  busy = true;
+  turnDone = false; // стрим начался, ждём assistant-turn-done
+  refreshBusyIndicator();
+});
+
+ipcRenderer.on("assistant-emotion", (_event, { emotion }) => {
+  applyEmotion(emotion);
+});
+
+ipcRenderer.on("assistant-chunk", (_event, { index, text, audio }) => {
+  chunkBuffer.set(index, { text, audio });
+  refreshBusyIndicator();
+  tryPlayNextChunk();
+});
+
+ipcRenderer.on("assistant-turn-done", () => {
+  turnDone = true;
+  refreshBusyIndicator();
 });
 
 // --- Дебаг: перебор выражений модели (Ctrl+Alt+Left/Right/R/M в main.js) ---

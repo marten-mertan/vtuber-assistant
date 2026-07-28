@@ -74,6 +74,28 @@ def transliterate_english(text: str) -> str:
     return _LATIN_WORD_RE.sub(lambda m: _transliterate_word(m.group(0)), text)
 
 
+# --- Удаление эмодзи и прочих непроизносимых символов ---------------------
+# Silero падает (или выдаёт мусор) на эмодзи — она их просто не умеет
+# читать. Чанки в потоковом режиме иногда состоят ПОЧТИ целиком из эмодзи
+# (например, ответ модели заканчивается на "!  😉") — сейчас такое чистится
+# до синтеза, это вторая линия защиты, чтобы не падать с 500-ошибкой.
+
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"  # символы/пиктограммы, эмоции, транспорт и т.д.
+    "\U00002600-\U000027BF"  # разное (☀-➿), дингбаты
+    "\U0001F1E6-\U0001F1FF"  # флаги (региональные буквы)
+    "\U0000FE0F"             # variation selector (модификатор "эмодзи-стиль")
+    "\U0000200D"             # zero-width joiner (склейка составных эмодзи)
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def strip_emoji(text: str) -> str:
+    return _EMOJI_RE.sub("", text)
+
+
 def _ensure_model():
     if not MODEL_PATH.exists():
         print(f"Скачиваю модель Silero TTS в {MODEL_PATH} (один раз)...")
@@ -103,6 +125,14 @@ def tts_route():
     if not text:
         return jsonify({"error": "empty text"}), 400
 
+    text = strip_emoji(text).strip()
+    if not text:
+        # Было что-то вроде "😉" или "!!!" без единой произносимой буквы —
+        # это не ошибка, просто озвучивать нечего. Отдаём явный статус,
+        # а не падаем с 500 — main.js на стороне клиента такое
+        # уже трактует как "нет аудио для этого чанка" и просто пропускает.
+        return jsonify({"error": "nothing to synthesize after cleanup", "empty": True}), 422
+
     text = transliterate_english(text)
 
     t0 = time.time()
@@ -115,7 +145,8 @@ def tts_route():
             put_yo=True,
         )
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        error_msg = str(e) or f"{type(e).__name__} (без сообщения)"
+        return jsonify({"error": error_msg}), 500
     dt = time.time() - t0
 
     buf = io.BytesIO()

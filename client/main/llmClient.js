@@ -2,9 +2,7 @@
 // Модуль общения с локальным KoboldCPP через его OpenAI-совместимый API
 // (/v1/chat/completions). Отвечает за:
 //  - системный промпт (персону)
-//  - формат ответа (JSON: reply + emotion)
-//  - устойчивый парсинг ответа модели (локальные модели иногда
-//    оборачивают JSON в markdown, добавляют лишний текст и т.п.)
+//  - формат ответа: "<emotion>текст" (GBNF-грамматика)
 
 const EMOTIONS = [
   "neutral",
@@ -21,28 +19,59 @@ const EMOTIONS = [
   "disappointed",
 ];
 
-// JSON Schema, которую KoboldCPP (начиная с v1.90.2) использует для
-// grammar-constrained генерации: модель физически не может выдать ничего,
-// кроме объекта такой формы — никакого текста до/после, никаких лишних полей.
-// Требует поле "grammar" в теле запроса к /v1/chat/completions (см. send()).
-const RESPONSE_SCHEMA = {
-  type: "object",
-  properties: {
-    reply: { type: "string" },
-    emotion: { type: "string", enum: EMOTIONS },
-  },
-  required: ["reply", "emotion"],
-  additionalProperties: false,
-};
+// GBNF-грамматика.
+// Формат "<emotion>текст"
+const emotionAlternatives = EMOTIONS.map((e) => JSON.stringify(e)).join(" | ");
+const TAG_GRAMMAR = `root ::= "<" emotion ">" text
+emotion ::= ${emotionAlternatives}
+text ::= [^<]+
+`;
 
-const SYSTEM_PROMPT = `Ты — виртуальный ассистент по имени Аи. У тебя дружелюбный,
+const SYSTEM_PROMPT = `Ты — виртуальный ассистент-вьюбер по имени Аи. У тебя дружелюбный,
 слегка озорной характер, ты искренне интересуешься собеседником и общаешься на русском языке.
 
 Отвечай КРАТКО — обычно 1-2 предложения, максимум 3. Это живой разговор,
 а не монолог: короткие реплики звучат естественнее и быстрее озвучиваются.
 
-Ты отвечаешь только в поле "reply", а поле "emotion" выбирай исходя из смысла
-своей реплики и настроения диалога.`;
+Формат ответа СТРОГО такой, без пояснений и текста до/после:
+<emotion>текст ответа
+
+Где emotion — одна из: ${EMOTIONS.join(", ")}. Сразу после ">" идёт текст
+ответа, без пробела, без кавычек.`;
+
+/**
+ * Возвращает завершённые предложения из накопленного буфера и остаток
+ * без завершающей пунктуации (ещё может дополниться следующими токенами).
+ * Режем ТОЛЬКО по .!? — но группой (чтобы не резать "..." или "?!" на
+ * части), и только если после группы уже виден НЕ-пунктуационный символ
+ * (иначе не знаем, не продолжится ли пунктуация следующим токеном).
+ */
+function splitCompleteSentences(buffer) {
+  const re = /[.!?]+(?![.!?])/g;
+  let match;
+  let lastCut = -1;
+  while ((match = re.exec(buffer)) !== null) {
+    const endIdx = match.index + match[0].length;
+    if (endIdx === buffer.length) break; // конец группы совпал с концом буфера — не уверены, что она завершена
+    lastCut = endIdx;
+  }
+  if (lastCut === -1) return { complete: [], rest: buffer };
+
+  const completeText = buffer.slice(0, lastCut);
+  const rest = buffer.slice(lastCut);
+
+  const sentences = [];
+  let start = 0;
+  const re2 = /[.!?]+(?![.!?])/g;
+  let m2;
+  while ((m2 = re2.exec(completeText)) !== null) {
+    const end = m2.index + m2[0].length;
+    const s = completeText.slice(start, end).trim();
+    if (s) sentences.push(s);
+    start = end;
+  }
+  return { complete: sentences, rest };
+}
 
 class LLMClient {
   /**
@@ -70,9 +99,23 @@ class LLMClient {
     }
   }
 
+  /** Разбирает "<emotion>текст" -> { reply, emotion } */
+  _parseTagFormat(text) {
+    const trimmed = text.trim();
+    const match = trimmed.match(/^<([^>]*)>([\s\S]*)$/);
+    if (!match) {
+      // Модель не выдала тег (не должно происходить при grammar-constraint,
+      // но не роняем пайплайн, если вдруг) — отдаём как есть, нейтрально.
+      return { reply: trimmed, emotion: "neutral" };
+    }
+    const [, tag, body] = match;
+    const emotion = EMOTIONS.includes(tag) ? tag : "neutral";
+    return { reply: body.trim(), emotion };
+  }
+
   /**
-   * Отправляет реплику пользователя, возвращает { reply, emotion, raw }
-   * @param {string} userText
+   * Обычная (не потоковая) генерация — используется консольным
+   * fallback (chat.js). Возвращает { reply, emotion, raw }.
    */
   async send(userText) {
     this.history.push({ role: "user", content: userText });
@@ -84,7 +127,7 @@ class LLMClient {
         messages: this.history,
         temperature: this.temperature,
         max_tokens: this.maxTokens,
-        grammar: JSON.stringify(RESPONSE_SCHEMA),
+        grammar: TAG_GRAMMAR,
       }),
     });
 
@@ -94,37 +137,102 @@ class LLMClient {
 
     const data = await res.json();
     const rawContent = data?.choices?.[0]?.message?.content ?? "";
+    const parsed = this._parseTagFormat(rawContent);
 
-    const parsed = this._parseModelOutput(rawContent);
-
-    // Сохраняем в историю уже "чистую" реплику, а не сырой JSON —
-    // иначе модель со временем начнёт путаться и генерировать JSON внутри JSON
     this.history.push({ role: "assistant", content: parsed.reply });
 
     return { ...parsed, raw: rawContent };
   }
 
-  /** Устойчивый парсинг: достаёт JSON даже если модель что-то добавила вокруг */
-  _parseModelOutput(text) {
-    const cleaned = text.trim().replace(/^```json\s*|^```\s*|```$/gim, "");
+  /**
+   * Потоковая генерация через SSE. Коллбэки вызываются по мере готовности:
+   *   onEmotion(emotion) — один раз, как только распознан тег в начале ответа
+   *   onSentence(sentenceText) — на каждое завершённое предложение
+   * Возвращает { reply, emotion } с полным текстом после завершения потока.
+   */
+  async sendStream(userText, { onEmotion, onSentence } = {}) {
+    this.history.push({ role: "user", content: userText });
 
-    let jsonStr = cleaned;
-    const firstBrace = cleaned.indexOf("{");
-    const lastBrace = cleaned.lastIndexOf("}");
-    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-      jsonStr = cleaned.slice(firstBrace, lastBrace + 1);
+    const res = await fetch(`${this.baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messages: this.history,
+        temperature: this.temperature,
+        max_tokens: this.maxTokens,
+        grammar: TAG_GRAMMAR,
+        stream: true,
+      }),
+    });
+
+    if (!res.ok) {
+      throw new Error(`KoboldCPP вернул ошибку: HTTP ${res.status} ${await res.text()}`);
     }
 
-    try {
-      const obj = JSON.parse(jsonStr);
-      const emotion = EMOTIONS.includes(obj.emotion) ? obj.emotion : "neutral";
-      const reply = typeof obj.reply === "string" ? obj.reply : cleaned;
-      return { reply, emotion };
-    } catch {
-      // Модель не выдала валидный JSON — не роняем пайплайн,
-      // отдаём сырой текст с нейтральной эмоцией
-      return { reply: cleaned, emotion: "neutral" };
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+
+    let sseBuffer = "";
+    let rawText = "";
+    let emotion = null;
+    let awaitingEmotion = true;
+    let sentenceBuffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      sseBuffer += decoder.decode(value, { stream: true });
+      const lines = sseBuffer.split("\n");
+      sseBuffer = lines.pop(); // неполная последняя строка — ждём продолжения
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+        const payload = trimmed.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+
+        let json;
+        try {
+          json = JSON.parse(payload);
+        } catch {
+          continue; // неполный/битый JSON-чанк — пропускаем
+        }
+        const delta = json?.choices?.[0]?.delta?.content;
+        if (!delta) continue;
+
+        rawText += delta;
+
+        if (awaitingEmotion) {
+          const closeIdx = rawText.indexOf(">");
+          if (closeIdx === -1) continue; // тег ещё не набрался полностью
+          const tag = rawText.slice(rawText.startsWith("<") ? 1 : 0, closeIdx);
+          emotion = EMOTIONS.includes(tag) ? tag : "neutral";
+          onEmotion?.(emotion);
+          sentenceBuffer = rawText.slice(closeIdx + 1);
+          awaitingEmotion = false;
+          continue;
+        }
+
+        sentenceBuffer += delta;
+        const { complete, rest } = splitCompleteSentences(sentenceBuffer);
+        for (const s of complete) onSentence?.(s);
+        sentenceBuffer = rest;
+      }
     }
+
+    // Хвост без завершающей пунктуации — модель могла упереться в
+    // max_tokens или просто не закончить знаком препинания.
+    const tail = sentenceBuffer.trim();
+    if (tail) onSentence?.(tail);
+
+    const closeIdx = rawText.indexOf(">");
+    const fullReply = (closeIdx === -1 ? rawText : rawText.slice(closeIdx + 1)).trim();
+    const finalEmotion = emotion || "neutral";
+
+    this.history.push({ role: "assistant", content: fullReply });
+
+    return { reply: fullReply, emotion: finalEmotion };
   }
 
   resetHistory() {
