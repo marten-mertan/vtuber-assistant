@@ -2,7 +2,7 @@
 // Модуль общения с локальным KoboldCPP через его OpenAI-совместимый API
 // (/v1/chat/completions). Отвечает за:
 //  - системный промпт (персону)
-//  - формат ответа: "<emotion>текст" (GBNF-грамматика)
+//  - формат ответа: "emotion|текст" (GBNF-грамматика)
 
 const EMOTIONS = [
   "neutral",
@@ -19,12 +19,12 @@ const EMOTIONS = [
   "disappointed",
 ];
 
-// GBNF-грамматика.
-// Формат "<emotion>текст"
+// GBNF-грамматика вместо JSON Schema. 
+// Формат "emotion|текст"
 const emotionAlternatives = EMOTIONS.map((e) => JSON.stringify(e)).join(" | ");
-const TAG_GRAMMAR = `root ::= "<" emotion ">" text
+const TAG_GRAMMAR = `root ::= emotion "|" text
 emotion ::= ${emotionAlternatives}
-text ::= [^<]+
+text ::= [^|<]+
 `;
 
 const SYSTEM_PROMPT = `Ты — виртуальный ассистент-вьюбер по имени Аи. У тебя дружелюбный,
@@ -34,10 +34,11 @@ const SYSTEM_PROMPT = `Ты — виртуальный ассистент-вью
 а не монолог: короткие реплики звучат естественнее и быстрее озвучиваются.
 
 Формат ответа СТРОГО такой, без пояснений и текста до/после:
-<emotion>текст ответа
+emotion|текст ответа
 
-Где emotion — одна из: ${EMOTIONS.join(", ")}. Сразу после ">" идёт текст
-ответа, без пробела, без кавычек.`;
+Где emotion — одна из: ${EMOTIONS.join(", ")}. Сразу после "|" идёт текст
+ответа, без пробела, без кавычек. Никаких дополнительных тегов, скобок
+или пометок вокруг текста не добавляй.`;
 
 /**
  * Возвращает завершённые предложения из накопленного буфера и остаток
@@ -99,13 +100,14 @@ class LLMClient {
     }
   }
 
-  /** Разбирает "<emotion>текст" -> { reply, emotion } */
+  /** Разбирает "emotion|текст" -> { reply, emotion } */
   _parseTagFormat(text) {
     const trimmed = text.trim();
-    const match = trimmed.match(/^<([^>]*)>([\s\S]*)$/);
+    const match = trimmed.match(/^([a-z]+)\|([\s\S]*)$/);
     if (!match) {
-      // Модель не выдала тег (не должно происходить при grammar-constraint,
-      // но не роняем пайплайн, если вдруг) — отдаём как есть, нейтрально.
+      // Модель не выдала разделитель (не должно происходить при
+      // grammar-constraint, но не роняем пайплайн, если вдруг) — отдаём
+      // как есть, нейтрально.
       return { reply: trimmed, emotion: "neutral" };
     }
     const [, tag, body] = match;
@@ -204,12 +206,12 @@ class LLMClient {
         rawText += delta;
 
         if (awaitingEmotion) {
-          const closeIdx = rawText.indexOf(">");
-          if (closeIdx === -1) continue; // тег ещё не набрался полностью
-          const tag = rawText.slice(rawText.startsWith("<") ? 1 : 0, closeIdx);
+          const sepIdx = rawText.indexOf("|");
+          if (sepIdx === -1) continue; // emotion ещё не набрался полностью
+          const tag = rawText.slice(0, sepIdx);
           emotion = EMOTIONS.includes(tag) ? tag : "neutral";
           onEmotion?.(emotion);
-          sentenceBuffer = rawText.slice(closeIdx + 1);
+          sentenceBuffer = rawText.slice(sepIdx + 1);
           awaitingEmotion = false;
           continue;
         }
@@ -226,8 +228,8 @@ class LLMClient {
     const tail = sentenceBuffer.trim();
     if (tail) onSentence?.(tail);
 
-    const closeIdx = rawText.indexOf(">");
-    const fullReply = (closeIdx === -1 ? rawText : rawText.slice(closeIdx + 1)).trim();
+    const sepIdx = rawText.indexOf("|");
+    const fullReply = (sepIdx === -1 ? rawText : rawText.slice(sepIdx + 1)).trim();
     const finalEmotion = emotion || "neutral";
 
     this.history.push({ role: "assistant", content: fullReply });
