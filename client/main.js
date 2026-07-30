@@ -9,7 +9,7 @@
 // отсюда намеренно — KOBOLD_URL может указывать куда угодно, не обязан
 // быть именно локальным KoboldCPP, это осознанный выбор гибкости.
 
-const { app, BrowserWindow, globalShortcut, screen, ipcMain } = require("electron");
+const { app, BrowserWindow, globalShortcut, screen, ipcMain, desktopCapturer } = require("electron");
 const { spawn } = require("child_process");
 const path = require("path");
 
@@ -33,6 +33,7 @@ let win;
 let clickThrough = false;
 let isRecording = false;
 let isBusy = false; // защита от повторного запуска пайплайна, пока предыдущий не закончился
+let pendingScreenshot = null; // скриншот, захваченный перед началом записи (Ctrl+Alt+S) — прикладывается к следующему сообщению
 
 // --- Конфигурация из .env (та же логика, что была в консольном chat.js) ---
 const koboldUrl = process.env.KOBOLD_URL || "http://localhost:5001";
@@ -136,6 +137,36 @@ async function waitForBackend(timeoutMs = 180000) {
   return false;
 }
 
+// Пресет-промпт для хоткея "скриншот без голоса" (Ctrl+Alt+D).
+const SCREENSHOT_PROMPT =
+  process.env.SCREENSHOT_PROMPT ||
+  "Вот что сейчас у меня на экране. Прокомментируй коротко, как будто заметила это мельком.";
+
+/**
+ * Захватывает основной экран целиком, отдаёт PNG в base64.
+ * ПОКА без выбора конкретного окна/области — просто берём весь primaryDisplay.
+ */
+async function captureScreenshot() {
+  const primaryDisplay = screen.getPrimaryDisplay();
+  const { width, height } = primaryDisplay.size;
+  try {
+    const sources = await desktopCapturer.getSources({
+      types: ["screen"],
+      thumbnailSize: { width, height },
+    });
+    if (!sources.length) {
+      console.error("[screenshot] desktopCapturer не вернул ни одного источника экрана");
+      return null;
+    }
+    const png = sources[0].thumbnail.toPNG();
+    console.log(`[screenshot] Захвачено: ${(png.length / 1024).toFixed(0)} КБ`);
+    return png.toString("base64");
+  } catch (err) {
+    console.error(`[screenshot] Ошибка захвата: ${err.message}`);
+    return null;
+  }
+}
+
 function createWindow() {
   const { width: screenW, height: screenH } = screen.getPrimaryDisplay().workAreaSize;
 
@@ -181,7 +212,7 @@ async function startRecording() {
   try {
     await stt.start();
     isRecording = true;
-    isBusy = true; // единый флаг "занято" держится до подтверждения от renderer, что звук доиграл (см. ipcMain.on("renderer-idle"))
+    isBusy = true; // единый флаг "занято" держится теперь до подтверждения от renderer, что звук доиграл (см. ipcMain.on("renderer-idle"))
     win.webContents.send("assistant-status", { state: "listening" });
     console.log("[pipeline] recording started");
   } catch (err) {
@@ -222,10 +253,75 @@ async function synthesizeChunk(text) {
   }
 }
 
+/**
+ * Общая логика ответа: отправляет текст (+опционально изображение) в LLM
+ * потоково, чанкует по предложениям, синтезирует и шлёт в renderer.
+ * Переиспользуется и голосовым пайплайном, и хоткеем "скриншот без голоса".
+ */
+async function respondToText(userText, { imageBase64 } = {}) {
+  win.webContents.send("assistant-chunk-start", { userText });
+
+  // Очередь предложений от LLM-стрима. onSentence вызывается синхронно
+  // по мере чтения SSE — сам TTS/RVC для чанка НЕ ждём тут же (это бы
+  // застопорило чтение следующих токенов), а складываем в очередь и
+  // разбираем отдельным "воркером" ниже, который работает параллельно
+  // с продолжающимся чтением потока от LLM.
+  const sentenceQueue = [];
+  let queueWake = null;
+  let streamDone = false;
+  let chunkIndex = 0;
+
+  function enqueue(sentenceText) {
+    sentenceQueue.push(sentenceText);
+    if (queueWake) {
+      queueWake();
+      queueWake = null;
+    }
+  }
+
+  async function drainQueue() {
+    while (true) {
+      if (sentenceQueue.length === 0) {
+        if (streamDone) return;
+        await new Promise((resolve) => {
+          queueWake = resolve;
+        });
+        continue;
+      }
+      const sentenceText = sentenceQueue.shift();
+      const idx = chunkIndex++;
+      const audio = await synthesizeChunk(sentenceText);
+      win.webContents.send("assistant-chunk", { index: idx, text: sentenceText, audio });
+    }
+  }
+
+  const drainPromise = drainQueue();
+
+  const { reply, emotion } = await llm.sendStream(userText, {
+    imageBase64,
+    onEmotion: (em) => {
+      win.webContents.send("assistant-emotion", { emotion: em });
+    },
+    onSentence: (sentenceText) => enqueue(sentenceText),
+  });
+
+  streamDone = true;
+  if (queueWake) {
+    queueWake();
+    queueWake = null;
+  }
+  await drainPromise;
+
+  console.log(`[pipeline] LLM [${emotion}] (полный ответ): ${reply}`);
+}
+
 async function stopRecordingAndRespond() {
   if (!isRecording) return;
   isRecording = false;
   win.webContents.send("assistant-status", { state: "thinking" });
+
+  const imageBase64 = pendingScreenshot;
+  pendingScreenshot = null;
 
   try {
     const { text, warning, duration, process_time } = await stt.stop();
@@ -238,59 +334,41 @@ async function stopRecordingAndRespond() {
       return;
     }
 
-    win.webContents.send("assistant-chunk-start", { userText: text });
+    await respondToText(text, { imageBase64 });
+    win.webContents.send("assistant-turn-done", {});
+  } catch (err) {
+    console.error(`[pipeline] error: ${err.message}`);
+    win.webContents.send("assistant-status", { state: "error", message: err.message });
+    win.webContents.send("assistant-turn-done", {});
+  }
+}
 
-    // Очередь предложений от LLM-стрима. onSentence вызывается синхронно
-    // по мере чтения SSE — сам TTS/RVC для чанка НЕ ждём тут же (это бы
-    // застопорило чтение следующих токенов), а складываем в очередь и
-    // разбираем отдельным "воркером" ниже, который работает параллельно
-    // с продолжающимся чтением потока от LLM.
-    const sentenceQueue = [];
-    let queueWake = null;
-    let streamDone = false;
-    let chunkIndex = 0;
-
-    function enqueue(sentenceText) {
-      sentenceQueue.push(sentenceText);
-      if (queueWake) {
-        queueWake();
-        queueWake = null;
-      }
-    }
-
-    async function drainQueue() {
-      while (true) {
-        if (sentenceQueue.length === 0) {
-          if (streamDone) return;
-          await new Promise((resolve) => {
-            queueWake = resolve;
-          });
-          continue;
-        }
-        const sentenceText = sentenceQueue.shift();
-        const idx = chunkIndex++;
-        const audio = await synthesizeChunk(sentenceText);
-        win.webContents.send("assistant-chunk", { index: idx, text: sentenceText, audio });
-      }
-    }
-
-    const drainPromise = drainQueue();
-
-    const { reply, emotion } = await llm.sendStream(text, {
-      onEmotion: (em) => {
-        win.webContents.send("assistant-emotion", { emotion: em });
-      },
-      onSentence: (sentenceText) => enqueue(sentenceText),
+/** Хоткей "скриншот без голоса" — сразу отправляет с готовым промптом. */
+async function sendScreenshotWithPreset() {
+  if (isBusy || isRecording) return;
+  if (!backendReady) {
+    win.webContents.send("assistant-status", {
+      state: "error",
+      message: "voice-сервер ещё запускается, подожди немного",
     });
+    return;
+  }
 
-    streamDone = true;
-    if (queueWake) {
-      queueWake();
-      queueWake = null;
-    }
-    await drainPromise;
+  isBusy = true;
+  win.webContents.send("assistant-status", { state: "thinking" });
 
-    console.log(`[pipeline] LLM [${emotion}] (полный ответ): ${reply}`);
+  const imageBase64 = await captureScreenshot();
+  if (!imageBase64) {
+    win.webContents.send("assistant-status", {
+      state: "error",
+      message: "не удалось захватить экран",
+    });
+    win.webContents.send("assistant-turn-done", {});
+    return;
+  }
+
+  try {
+    await respondToText(SCREENSHOT_PROMPT, { imageBase64 });
     win.webContents.send("assistant-turn-done", {});
   } catch (err) {
     console.error(`[pipeline] error: ${err.message}`);
@@ -357,6 +435,25 @@ app.whenReady().then(async () => {
     }
   });
 
+  // Скриншот + голос: сначала захватываем экран, затем как обычный
+  // push-to-talk — говоришь, что хочешь спросить про то, что на экране.
+  registerHotkey("Control+Alt+S", async () => {
+    if (isBusy || isRecording) return;
+    const shot = await captureScreenshot();
+    if (!shot) {
+      win.webContents.send("assistant-status", { state: "error", message: "не удалось захватить экран" });
+      return;
+    }
+    pendingScreenshot = shot;
+    startRecording();
+  });
+
+  // Скриншот без голоса: сразу отправляется с готовым промптом
+  // (SCREENSHOT_PROMPT в .env)
+  registerHotkey("Control+Alt+D", () => {
+    sendScreenshotWithPreset();
+  });
+
   // --- Дебаг-хоткеи для каталогизации выражений модели ---
   // Многие модели (особенно с booth.pm) называют Expressions в model3.json
   // непрозрачными кодами (сокращения пиньиня и т.п.) — этим удобно глазами
@@ -376,6 +473,9 @@ app.whenReady().then(async () => {
 
   console.log(
     "Готово. Ctrl+Alt+Space — голосовой ввод, Ctrl+Alt+L — click-through, Ctrl+Alt+Q — выход."
+  );
+  console.log(
+    "Скриншоты: Ctrl+Alt+S — скриншот+голос, Ctrl+Alt+D — скриншот с готовым промптом."
   );
   console.log(
     "Дебаг: Ctrl+Alt+Left/Right — перебор выражений, Ctrl+Alt+F — сброс, Ctrl+Alt+T — motion."

@@ -116,11 +116,26 @@ class LLMClient {
   }
 
   /**
+   * Формирует content для сообщения — обычная строка, либо (если передан
+   * imageBase64) multipart-массив в формате OpenAI Vision API:
+   * [{type: "text", ...}, {type: "image_url", image_url: {url: "data:..."}}]
+   */
+  _buildContent(userText, imageBase64) {
+    if (!imageBase64) return userText;
+    return [
+      { type: "text", text: userText },
+      { type: "image_url", image_url: { url: `data:image/png;base64,${imageBase64}` } },
+    ];
+  }
+
+  /**
    * Обычная (не потоковая) генерация — используется консольным
    * fallback (chat.js). Возвращает { reply, emotion, raw }.
+   * imageBase64 — опционально, PNG-скриншот без префикса data URI.
    */
-  async send(userText) {
-    this.history.push({ role: "user", content: userText });
+  async send(userText, { imageBase64 } = {}) {
+    const userMessage = { role: "user", content: this._buildContent(userText, imageBase64) };
+    this.history.push(userMessage);
 
     const res = await fetch(`${this.baseUrl}/v1/chat/completions`, {
       method: "POST",
@@ -143,6 +158,10 @@ class LLMClient {
 
     this.history.push({ role: "assistant", content: parsed.reply });
 
+    if (imageBase64) {
+      this._scheduleImageMemory(userMessage, imageBase64, userText);
+    }
+
     return { ...parsed, raw: rawContent };
   }
 
@@ -150,10 +169,12 @@ class LLMClient {
    * Потоковая генерация через SSE. Коллбэки вызываются по мере готовности:
    *   onEmotion(emotion) — один раз, как только распознан тег в начале ответа
    *   onSentence(sentenceText) — на каждое завершённое предложение
+   *   imageBase64 — опционально, PNG-скриншот без префикса data URI.
    * Возвращает { reply, emotion } с полным текстом после завершения потока.
    */
-  async sendStream(userText, { onEmotion, onSentence } = {}) {
-    this.history.push({ role: "user", content: userText });
+  async sendStream(userText, { onEmotion, onSentence, imageBase64 } = {}) {
+    const userMessage = { role: "user", content: this._buildContent(userText, imageBase64) };
+    this.history.push(userMessage);
 
     const res = await fetch(`${this.baseUrl}/v1/chat/completions`, {
       method: "POST",
@@ -234,7 +255,63 @@ class LLMClient {
 
     this.history.push({ role: "assistant", content: fullReply });
 
+    if (imageBase64) {
+      this._scheduleImageMemory(userMessage, imageBase64, userText);
+    }
+
     return { reply: fullReply, emotion: finalEmotion };
+  }
+
+  /**
+   * Фоново (НЕ блокируя основной ответ — не await'им это в send/sendStream)
+   * просит модель детально описать картинку отдельным изолированным
+   * запросом (не через this.history, чтобы не засорять основной диалог),
+   * затем заменяет content уже отправленного сообщения в истории на это
+   * текстовое описание.
+   *
+   * Зачем: если оставить картинку в истории как есть, KoboldCPP будет
+   * заново ПЕРЕКОДИРОВАТЬ её на каждый следующий запрос (даже никак не
+   * связанный со скриншотом) — на практике это добавляет секунды на
+   * каждое сообщение, и они множатся с числом сделанных скриншотов за
+   * сессию. Текстовое описание почти ничего не стоит на последующих
+   * запросах, а содержание картинки в памяти диалога остаётся.
+   */
+  _scheduleImageMemory(userMessage, imageBase64, originalUserText) {
+    this._summarizeImage(imageBase64, originalUserText)
+      .then((summary) => {
+        userMessage.content = `[Скриншот] ${originalUserText}\n(На картинке: ${summary})`;
+      })
+      .catch((err) => {
+        console.warn(`[llmClient] Не удалось сделать vision-память для скриншота: ${err.message}`);
+        // Content НЕ трогаем при ошибке — картинка остаётся в истории как
+        // есть (будет перекодирована ещё раз, но хотя бы не потеряется).
+      });
+  }
+
+  /** Изолированный запрос на подробное описание картинки — без grammar, без стрима, не трогает this.history. */
+  async _summarizeImage(imageBase64, originalUserText) {
+    const prompt =
+      `Подробно опиши, что изображено на этом скриншоте — это будет использовано ` +
+      `как память на будущее в разговоре. Контекст, зачем его показали: "${originalUserText}". ` +
+      `Пиши сплошным текстом без форматирования, 3-5 предложений, только суть увиденного.`;
+
+    const res = await fetch(`${this.baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messages: [{ role: "user", content: this._buildContent(prompt, imageBase64) }],
+        temperature: 0.3,
+        max_tokens: 300,
+      }),
+    });
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} ${await res.text()}`);
+    }
+
+    const data = await res.json();
+    const text = data?.choices?.[0]?.message?.content ?? "";
+    return text.trim();
   }
 
   resetHistory() {
