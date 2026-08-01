@@ -9,9 +9,13 @@
 // отсюда намеренно — KOBOLD_URL может указывать куда угодно, не обязан
 // быть именно локальным KoboldCPP, это осознанный выбор гибкости.
 
-const { app, BrowserWindow, globalShortcut, screen, ipcMain, desktopCapturer } = require("electron");
+const { app, BrowserWindow, globalShortcut, screen, ipcMain } = require("electron");
 const { spawn } = require("child_process");
 const path = require("path");
+
+const captureTarget = require("./main/captureTarget.js");
+const sourcePicker = require("./main/sourcePicker.js");
+const cropSelector = require("./main/cropSelector.js");
 
 // appRoot — папка, где лежат server/, models/, live2d-core/, .env.
 // В разработке (npm start) это корень репозитория (на уровень выше client/).
@@ -141,31 +145,6 @@ async function waitForBackend(timeoutMs = 180000) {
 const SCREENSHOT_PROMPT =
   process.env.SCREENSHOT_PROMPT ||
   "Вот что сейчас у меня на экране. Прокомментируй коротко, как будто заметила это мельком.";
-
-/**
- * Захватывает основной экран целиком, отдаёт PNG в base64.
- * ПОКА без выбора конкретного окна/области — просто берём весь primaryDisplay.
- */
-async function captureScreenshot() {
-  const primaryDisplay = screen.getPrimaryDisplay();
-  const { width, height } = primaryDisplay.size;
-  try {
-    const sources = await desktopCapturer.getSources({
-      types: ["screen"],
-      thumbnailSize: { width, height },
-    });
-    if (!sources.length) {
-      console.error("[screenshot] desktopCapturer не вернул ни одного источника экрана");
-      return null;
-    }
-    const png = sources[0].thumbnail.toPNG();
-    console.log(`[screenshot] Захвачено: ${(png.length / 1024).toFixed(0)} КБ`);
-    return png.toString("base64");
-  } catch (err) {
-    console.error(`[screenshot] Ошибка захвата: ${err.message}`);
-    return null;
-  }
-}
 
 function createWindow() {
   const { width: screenW, height: screenH } = screen.getPrimaryDisplay().workAreaSize;
@@ -357,7 +336,7 @@ async function sendScreenshotWithPreset() {
   isBusy = true;
   win.webContents.send("assistant-status", { state: "thinking" });
 
-  const imageBase64 = await captureScreenshot();
+  const imageBase64 = await captureTarget.captureScreenshot();
   if (!imageBase64) {
     win.webContents.send("assistant-status", {
       state: "error",
@@ -439,7 +418,7 @@ app.whenReady().then(async () => {
   // push-to-talk — говоришь, что хочешь спросить про то, что на экране.
   registerHotkey("Control+Alt+S", async () => {
     if (isBusy || isRecording) return;
-    const shot = await captureScreenshot();
+    const shot = await captureTarget.captureScreenshot();
     if (!shot) {
       win.webContents.send("assistant-status", { state: "error", message: "не удалось захватить экран" });
       return;
@@ -452,6 +431,32 @@ app.whenReady().then(async () => {
   // (SCREENSHOT_PROMPT в .env)
   registerHotkey("Control+Alt+D", () => {
     sendScreenshotWithPreset();
+  });
+
+  // Выбор цели захвата: список экранов/окон -> опционально выделение
+  // области мышью. Результат сохраняется и используется всеми
+  // последующими Ctrl+Alt+S / Ctrl+Alt+D, пока не переназначишь заново.
+  registerHotkey("Control+Alt+C", () => {
+    sourcePicker.open(async (source) => {
+      if (!source) {
+        console.log("[capture] Выбор источника отменён");
+        return;
+      }
+      captureTarget.setTarget(source.id, source.name);
+      console.log(`[capture] Цель захвата: ${source.name}`);
+
+      const rawBase64 = await captureTarget.captureSourceRaw(source.id);
+      if (!rawBase64) return;
+
+      cropSelector.open(rawBase64, (cropRect) => {
+        if (cropRect === undefined) {
+          console.log("[capture] Выделение области отменено — используется кадр целиком");
+          return;
+        }
+        captureTarget.setCrop(cropRect);
+        console.log(`[capture] Область: ${cropRect ? JSON.stringify(cropRect) : "весь кадр"}`);
+      });
+    });
   });
 
   // --- Дебаг-хоткеи для каталогизации выражений модели ---
@@ -475,7 +480,7 @@ app.whenReady().then(async () => {
     "Готово. Ctrl+Alt+Space — голосовой ввод, Ctrl+Alt+L — click-through, Ctrl+Alt+Q — выход."
   );
   console.log(
-    "Скриншоты: Ctrl+Alt+S — скриншот+голос, Ctrl+Alt+D — скриншот с готовым промптом."
+    "Скриншоты: Ctrl+Alt+S — скриншот+голос, Ctrl+Alt+D — скриншот с готовым промптом, Ctrl+Alt+C — выбор цели захвата."
   );
   console.log(
     "Дебаг: Ctrl+Alt+Left/Right — перебор выражений, Ctrl+Alt+F — сброс, Ctrl+Alt+T — motion."
